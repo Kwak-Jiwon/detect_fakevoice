@@ -1,0 +1,221 @@
+import numpy as np
+import pandas as pd
+import librosa
+import random
+from tqdm import tqdm
+import os
+import warnings
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+import torchmetrics
+import torchvision.transforms as transforms
+from torchvision import models
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+warnings.filterwarnings('ignore')
+
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+class Config:
+    SR = 32000
+    N_MELS = 128
+    ROOT_FOLDER = r'C:\Users\SM-PC\Desktop\2024 summer sem\dacon'
+    N_CLASSES = 2
+    BATCH_SIZE = 32
+    N_EPOCHS = 10
+    LR = 1e-4
+    SEED = 42
+    
+CONFIG = Config()
+
+def seed_everything(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+
+seed_everything(CONFIG.SEED)
+
+df = pd.read_csv(r"C:\Users\SM-PC\Desktop\2024 summer sem\dacon\train.csv")
+train, val, _, _ = train_test_split(df, df['label'], test_size=0.2, random_state=CONFIG.SEED)
+
+def get_mel_spectrogram(df, train_mode=True):
+    features = []
+    labels = []
+    for _, row in tqdm(df.iterrows()):
+        file_path = os.path.join(CONFIG.ROOT_FOLDER, row['path'])
+        y, sr = librosa.load(file_path, sr=CONFIG.SR)
+        
+        mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=CONFIG.N_MELS)
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        
+        if train_mode:
+            label = row['label']
+            label_vector = 0 if label == 'fake' else 1
+            labels.append(label_vector)
+
+        features.append(mel_db)
+
+    if train_mode:
+        return features, labels
+    return features
+
+train_features, train_labels = get_mel_spectrogram(train, True)
+val_features, val_labels = get_mel_spectrogram(val, True)
+
+class MelSpectrogramDataset(Dataset):
+    def __init__(self, features, labels=None, transform=None):
+        self.features = features
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+        feature = self.features[index]
+        if self.transform:
+            feature = self.transform(feature)
+        if self.labels is not None:
+            label = self.labels[index]
+            return feature, label
+        return feature
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Resize((224, 224)),
+    transforms.Grayscale(3)
+])
+
+train_dataset = MelSpectrogramDataset(train_features, train_labels, transform=transform)
+val_dataset = MelSpectrogramDataset(val_features, val_labels, transform=transform)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=CONFIG.BATCH_SIZE,
+    shuffle=True
+)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=CONFIG.BATCH_SIZE,
+    shuffle=False
+)
+
+class GoogLeNetClassifier(nn.Module):
+    def __init__(self, output_dim=CONFIG.N_CLASSES):
+        super(GoogLeNetClassifier, self).__init__()
+        self.model = models.googlenet(pretrained=True)
+        self.model.fc = nn.Linear(self.model.fc.in_features, output_dim)
+    
+    def forward(self, x):
+        return self.model(x)
+
+def train(model, optimizer, train_loader, val_loader, device):
+    model.to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
+    
+    best_val_score = 0
+    best_model = None
+    
+    for epoch in range(1, CONFIG.N_EPOCHS+1):
+        model.train()
+        train_loss = []
+        for features, labels in tqdm(iter(train_loader)):
+            features = features.float().to(device)
+            labels = labels.long().to(device)
+            
+            optimizer.zero_grad()
+            
+            output = model(features)
+            loss = criterion(output, labels)
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss.append(loss.item())
+                    
+        _val_loss, _val_score = validation(model, criterion, val_loader, device)
+        _train_loss = np.mean(train_loss)
+        print(f'Epoch [{epoch}], Train Loss : [{_train_loss:.5f}] Val Loss : [{_val_loss:.5f}] Val AUC : [{_val_score:.5f}]')
+            
+        if best_val_score < _val_score:
+            best_val_score = _val_score
+            best_model = model
+    
+    return best_model
+
+def multiLabel_AUC(y_true, y_scores):
+    auc = roc_auc_score(y_true, y_scores, multi_class='ovo')
+    return auc
+    
+def validation(model, criterion, val_loader, device):
+    model.eval()
+    val_loss, all_labels, all_probs = [], [], []
+    
+    with torch.no_grad():
+        for features, labels in tqdm(iter(val_loader)):
+            features = features.float().to(device)
+            labels = labels.long().to(device)
+            
+            probs = model(features)
+            
+            loss = criterion(probs, labels)
+
+            val_loss.append(loss.item())
+
+            all_labels.append(labels.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
+        
+        _val_loss = np.mean(val_loss)
+
+        all_labels = np.concatenate(all_labels, axis=0)
+        all_probs = np.concatenate(all_probs, axis=0)
+        
+        auc_score = multiLabel_AUC(all_labels, all_probs)
+    
+    return _val_loss, auc_score
+
+model = GoogLeNetClassifier()
+optimizer = torch.optim.Adam(params=model.parameters(), lr=CONFIG.LR)
+
+infer_model = train(model, optimizer, train_loader, val_loader, device)
+
+test = pd.read_csv(r"C:\Users\SM-PC\Desktop\2024 summer sem\dacon\test.csv")
+test_features = get_mel_spectrogram(test, False)
+test_dataset = MelSpectrogramDataset(test_features, transform=transform)
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=CONFIG.BATCH_SIZE,
+    shuffle=False
+)
+
+def inference(model, test_loader, device):
+    model.to(device)
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for features in tqdm(iter(test_loader)):
+            features = features.float().to(device)
+            
+            probs = model(features)
+
+            probs  = probs.cpu().detach().numpy()
+            predictions += probs.tolist()
+    return predictions
+
+preds = inference(infer_model, test_loader, device)
+
+submit = pd.read_csv(r"C:\Users\SM-PC\Desktop\2024 summer sem\dacon\sample_submission.csv")
+submit.iloc[:, 1:] = preds
+submit.head()
+
+submit.to_csv(r"C:\Users\SM-PC\Desktop\2024 summer sem\dacon\baseline_submit.csv", index=False)
